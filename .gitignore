@@ -1,0 +1,16 @@
+# build output
+bin/
+obj/
+publish/
+protected/
+obf/
+dist/
+confuser/
+*.user
+
+# CI-generated
+build/Confuser.gen.crproj
+cert.pfx
+
+# local offline NuGet config (never commit: CI needs nuget.org)
+nuget.config

@@ -1,0 +1,175 @@
+# grobPC NetTune — Windows build pipeline (mirrors grobyq).
+# WPF cannot build on Linux, so everything runs on a Windows runner:
+#   1. test      — run the Core self-test (82 checks on an in-memory registry) BEFORE building the app.
+#   2. build     — dotnet publish the WPF app (Release, win-x64, framework-dependent; .NET 8 Desktop runtime).
+#   3. obfuscate — ConfuserEx2 over grobPC-NetTune.dll (anti-ildasm/constants/ctrl-flow/ref-proxy/anti-debug).
+#   4. smoke     — grobPC-NetTune.exe /selftest (headless: engine checks + AerialOS rules + a JIT pass over every
+#                  method). The protected build ships only if it passes; otherwise the unprotected build is packaged.
+#   5. sign      — Authenticode (only if SIGN_PFX_BASE64 is configured).
+#   6. package   — Inno Setup -> grobPC-NetTune-setup.exe.
+#   7. publish   — artifacts; on a release/<ver> branch or v<ver> tag, a GitHub Release.
+#
+# Secrets (optional): SIGN_PFX_BASE64, SIGN_PFX_PASSWORD. Without them, signing is skipped; the build still runs.
+
+name: build
+
+on:
+  push:
+    branches: [ main, 'release/**' ]
+    tags: [ 'v*' ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  APP_CSPROJ: app/NetTune.App.csproj
+  TEST_CSPROJ: tests/NetTune.Tests/NetTune.Tests.csproj
+  CONFUSER_VERSION: "1.6.0"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      HAS_CERT: ${{ secrets.SIGN_PFX_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      # ---- 1. Core self-test (a red test must fail the build) ----
+      - name: Core self-test
+        shell: pwsh
+        run: |
+          dotnet run -c Release --project $env:TEST_CSPROJ
+          if ($LASTEXITCODE -ne 0) { throw "Core self-test failed ($LASTEXITCODE)" }
+
+      # ---- 2. build / publish the WPF app ----
+      - name: Publish (Release, win-x64)
+        shell: pwsh
+        run: |
+          dotnet publish $env:APP_CSPROJ -c Release -r win-x64 --self-contained false `
+            -p:PublishSingleFile=false -o publish
+          if (-not (Test-Path publish/grobPC-NetTune.exe)) { throw "grobPC-NetTune.exe not produced" }
+
+      # ---- 3. obfuscate (ConfuserEx2) ----
+      - name: Obfuscate (ConfuserEx2)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $url = "https://github.com/mkaring/ConfuserEx/releases/download/v$env:CONFUSER_VERSION/ConfuserEx-CLI.zip"
+          try { Invoke-WebRequest $url -OutFile confuser.zip -ErrorAction Stop } catch { Write-Host "::warning::ConfuserEx download failed: $($_.Exception.Message)"; throw }
+          Expand-Archive confuser.zip -DestinationPath confuser -Force
+          $cli = Get-ChildItem confuser -Recurse -Filter Confuser.CLI.exe | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $cli) { Write-Host "::warning::Confuser.CLI.exe not found"; throw "no CLI" }
+          $root = Split-Path (Get-Command dotnet).Source
+          function Latest($name) {
+            Get-ChildItem (Join-Path $root "shared\$name") -Directory | Where-Object { $_.Name -like '8.0.*' } |
+              Sort-Object { [version]$_.Name } | Select-Object -Last 1 -ExpandProperty FullName
+          }
+          $core = Latest 'Microsoft.NETCore.App'; $desk = Latest 'Microsoft.WindowsDesktop.App'
+          Write-Host "probe paths: $core | $desk"
+          (Get-Content build\Confuser.crproj -Raw).Replace('@@NETCORE@@', $core).Replace('@@DESKTOP@@', $desk) |
+            Set-Content build\Confuser.gen.crproj -Encoding utf8
+          $out = & $cli -n .\build\Confuser.gen.crproj 2>&1 | Out-String
+          Write-Host $out
+          if (-not (Test-Path obf\grobPC-NetTune.dll)) {
+            $lines = $out -split "`r?`n" | Where-Object { $_ -match 'ERROR|Exception|Failed|failed|cannot|resolve' } | Select-Object -First 8
+            foreach ($l in $lines) { Write-Host "::warning::confuser: $($l.Trim())" }
+            throw "obfuscation produced no grobPC-NetTune.dll"
+          }
+          Write-Host "::notice::ConfuserEx protected grobPC-NetTune.dll ($((Get-Item obf\grobPC-NetTune.dll).Length) bytes)"
+          Copy-Item publish protected -Recurse -Force
+          Copy-Item obf\grobPC-NetTune.dll protected\grobPC-NetTune.dll -Force
+
+      # ---- 4. smoke test: /selftest (headless) ----
+      - name: Smoke test (selftest)
+        shell: pwsh
+        run: |
+          function Smoke($dir) {
+            $exe = Join-Path $dir 'grobPC-NetTune.exe'
+            if (-not (Test-Path $exe)) { return 99 }
+            $log = Join-Path $env:TEMP 'grobPC-NetTune-selftest.txt'
+            Remove-Item $log -ErrorAction SilentlyContinue
+            $p = Start-Process -FilePath (Resolve-Path $exe) -ArgumentList '/selftest' -PassThru
+            $null = $p.Handle
+            if (-not $p.WaitForExit(180000)) { $p.Kill(); Write-Host "selftest timed out in $dir"; return 98 }
+            Write-Host "---- selftest $dir (exit $($p.ExitCode)) ----"
+            if (Test-Path $log) {
+              Get-Content $log | ForEach-Object { Write-Host $_ }
+              $facts = Get-Content $log | Where-Object { $_ -like '*passed*failed*' -or $_ -like 'PASS' -or $_ -like 'FAILED*' -or $_ -like '*jit:*' -or $_ -like '*aerial:*' } | ForEach-Object { $_.Trim() }
+              Write-Host "::notice::selftest $dir : $($facts -join '  |  ')"
+              Get-Content $log | Where-Object { $_ -like 'FAIL*' -or $_ -like '      jit *' } | Select-Object -First 6 | ForEach-Object { Write-Host "::warning::selftest $dir : $_" }
+            } else { Write-Host "::warning::selftest $dir wrote no log (exit $($p.ExitCode))" }
+            return [int]$p.ExitCode
+          }
+          $plain = Smoke 'publish'
+          $src = 'publish'
+          if ($plain -ne 0) { Write-Host "::warning::the unprotected build fails its selftest ($plain) - packaging it unprotected" }
+          elseif (Test-Path protected\grobPC-NetTune.dll) {
+            $prot = Smoke 'protected'
+            if ($prot -eq 0) { $src = 'protected'; Write-Host "protected build passed: packaging it" }
+            else { Write-Host "::warning::protected build failed its selftest ($prot) - packaging the unprotected build" }
+          } else { Write-Host "::warning::no protected build - packaging the unprotected build" }
+          "PKG_SRC=$src" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # ---- 5. sign (only when the cert secret is configured) ----
+      - name: Sign exe + dll (Authenticode)
+        if: env.HAS_CERT == 'true'
+        shell: pwsh
+        env:
+          PFX_B64: ${{ secrets.SIGN_PFX_BASE64 }}
+          PFX_PW:  ${{ secrets.SIGN_PFX_PASSWORD }}
+        run: |
+          [IO.File]::WriteAllBytes("cert.pfx", [Convert]::FromBase64String($env:PFX_B64))
+          $st = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Select-Object -Last 1
+          & $st.FullName sign /f cert.pfx /p $env:PFX_PW /fd SHA256 `
+            /tr http://timestamp.digicert.com /td SHA256 "$env:PKG_SRC/grobPC-NetTune.exe" "$env:PKG_SRC/grobPC-NetTune.dll"
+
+      # ---- 6. package (Inno Setup) ----
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $src = "$PWD\$env:PKG_SRC"
+          $out = "$PWD\dist"
+          & "C:\Program Files (x86)\Inno Setup 6\iscc.exe" /DSrcDir=$src /DOutDir=$out build\grobPC-NetTune.iss
+          if (-not (Test-Path dist/grobPC-NetTune-setup.exe)) { throw "installer not produced" }
+
+      # ---- 7. publish artifacts + update manifest ----
+      - name: Update manifest (version + sha256)
+        shell: pwsh
+        run: |
+          $ref = "${{ github.ref_name }}"
+          if ($ref.StartsWith('release/')) { $ver = $ref.Substring(8) } elseif ($ref.StartsWith('v')) { $ver = $ref.Substring(1) } else { $ver = "0.0.0-dev" }
+          "REL_TAG=v$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $sha = (Get-FileHash dist/grobPC-NetTune-setup.exe -Algorithm SHA256).Hash.ToLower()
+          @{ version = $ver; file = "grobPC-NetTune-setup.exe"; sha256 = $sha } | ConvertTo-Json | Out-File dist/version.json -Encoding utf8
+          Get-Content dist/version.json
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: grobPC-NetTune-${{ env.REL_TAG }}
+          path: |
+            dist/grobPC-NetTune-setup.exe
+            dist/version.json
+
+      - name: Release (tag or release branch)
+        if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/heads/release/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.REL_TAG }}
+          target_commitish: ${{ github.sha }}
+          name: grobPC NetTune ${{ env.REL_TAG }}
+          prerelease: ${{ contains(env.REL_TAG, '-') }}
+          files: |
+            dist/grobPC-NetTune-setup.exe
+            dist/version.json

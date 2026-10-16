@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Pure engine: no UI, no Windows API. Everything that touches the system goes through the interfaces in
+       Abstractions.cs (registry, network cmdlets, CPU topology), so the whole engine runs and is tested on any OS
+       with the in-memory doubles. The Windows implementations live in the app project. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>NetTune.Core</AssemblyName>
+    <RootNamespace>GrobPC.NetTune</RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <Version>2.0.0</Version>
+    <Product>grobPC NetTune by mitzu LLC</Product>
+    <Company>mitzu LLC</Company>
+  </PropertyGroup>
+
+</Project>
